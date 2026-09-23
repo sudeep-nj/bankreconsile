@@ -200,6 +200,8 @@ th.grp{text-align:center;font-size:11px;color:var(--ink);border-bottom:1px solid
 .subchip{display:inline-flex;align-items:center;gap:4px;font-size:14px;font-weight:600;background:var(--brand-soft);color:var(--brand);border-radius:999px;padding:3px 6px 3px 12px;vertical-align:middle}
 .subchip button{border:0;background:transparent;color:inherit;font-size:16px;line-height:1;padding:0 4px}
 tbody tr[data-s]{cursor:pointer}
+
+.tag.reversed{background:var(--line2);color:var(--muted)}
 </style>
 </head>
 <body>
@@ -253,12 +255,22 @@ const KINDS={
   nicA:{p:'nic',side:'A',label:'NIC Asia settlement',test:r=>findHeader(r,['session number','initiator'])},
   nicB:{p:'nic',side:'B',label:'Coop session ledger',test:r=>findHeader(r,['reference','session id'])},
   giblA:{p:'gibl',side:'A',label:'Global IME bank statement',test:r=>findHeader(r,['description','withdraw','deposit'])},
-  giblB:{p:'gibl',side:'B',label:'CBS GL statement',test:r=>findHeader(r,['reference','debit','credit'],['session id'])}
+  giblB:{p:'gibl',side:'B',label:'CBS GL statement',test:r=>findHeader(r,['reference','debit','credit'],['session id'])},
+  nicmA:{p:'nicm',side:'A',label:'NIC Asia system ledger',test:r=>findHeader(r,['nep date','eng date','tran type','description','debit','credit'])},
+  nicmB:{p:'nicm',side:'B',label:'NIC Asia mbank ledger',test:r=>findHeader(r,['particular','transaction id','tran status'])},
+  kblA:{p:'kbl',side:'A',label:'Kumari Bank statement',test:r=>findHeader(r,['tran particular','cr amt','dr amt'])},
+  kblB:{p:'kbl',side:'B',label:'Coop ledger statement (Kumari pool account)',test:r=>findHeader(r,['particulars','debit (dr)','credit (cr)'])}
 };
+function findAcct(rows){
+  for(const r of rows){for(const v of (r||[])){const s=String(v==null?'':v);let m;
+    if((m=s.match(/Acc(?:ount)?\.?\s*No\.?\s*:?\s*(\d{8,})/i)))return m[1];
+    if(/ledger statement of/i.test(s)&&(m=s.match(/\((\d{8,})\)/)))return m[1];}}
+  return '';
+}
 function detect(rows){for(const k of Object.keys(KINDS)){const h=KINDS[k].test(rows);if(h>=0)return {kind:k,hi:h}}return null}
 
 /* ================= profiles ================= */
-const COMMON_LABEL={side:'Side by side',matched:'Matched',probable:'Probable match',mismatch:'Amount differs'};
+const COMMON_LABEL={side:'Side by side',matched:'Matched',probable:'Probable match',mismatch:'Amount differs',reversed:'Reversed (net zero)'};
 const P={};
 
 /* ---------- NIC Asia vs Coop (session) ---------- */
@@ -369,6 +381,32 @@ function bankInfo(r){
   else if(/^WD:/i.test(d))r.cat='WD credit';
   const parts=rem.split('/');
   if(r.cat.startsWith('QR')&&parts.length>1){let t=parts[1].trim().replace(/^\+977-?/,'');if(t.length>=8&&!/^0+$/.test(t))r.tok=t}
+  r.ids=r.id?[r.id]:[];
+}
+function tokSet(s){const out=new Set();(String(s||'').match(/[A-Za-z0-9_\-+]{8,}/g)||[]).forEach(t=>{out.add(t.replace(/^\+977-?/,''));t.split('-').forEach(u=>{if(u.length>=8)out.add(u)})});return out}
+function kumariInfo(r){
+  const d=r.desc||'',x=r.rem||'';
+  r.id='';r.mid='';r.tok='';r.name='';
+  r.ids=[...tokSet(d)].filter(t=>/\d{6,}/.test(t)&&t!==r.acct);
+  if(/CALL TO CURRENT|CURRENT TO CALL/i.test(d))r.cat='Sweep (call ↔ current)';
+  else if(/Int\.?Pd/i.test(d))r.cat='Interest';
+  else if(/WTax/i.test(d))r.cat='Interest tax';
+  else if(/cheque|chq|clg|clearing/i.test(d+' '+x))r.cat='Cheque / clearing';
+  else r.cat=x?x.replace(/\b\w+/g,w=>w[0]+w.slice(1).toLowerCase()):'Other';
+  r.name=d;
+}
+function ledgerInfo(r){
+  const f=r.ref||'';
+  r.toks=tokSet(f);r.name='';
+  if(/balance b\/d|opening/i.test(f))r.cat='Opening balance';
+  else if(/^from mbl\s*:\s*coop transfer/i.test(f))r.cat='Mobile banking (coop transfer)';
+  else if(/^from mbl\s*:\s*\d{15,}/i.test(f)){r.cat='Mobile banking transfer';const m=f.split(' - ');if(m.length>1)r.name=m[1].trim()}
+  else if(/^from mbl/i.test(f))r.cat='Mobile banking load';
+  else if(/^int\//i.test(f))r.cat=r.dir==='in'?'Interest':'Interest tax';
+  else if(/cheque|chq/i.test(f))r.cat='Cheque deposit';
+  else if(/reverse/i.test(f))r.cat='Reversal';
+  else r.cat='Journal (manual)';
+  r.catG=r.cat;
 }
 function cbsInfo(r){
   const f=r.ref||'';let m;
@@ -411,7 +449,7 @@ function buildCalendar(B,pairs){
 }
 P.gibl={
   id:'gibl',title:'Global IME ↔ CBS',aName:'Global IME bank statement',bName:'CBS GL (bank account in Coop books)',aShort:'Bank',bShort:'CBS',
-  groupWord:'Month',hasSub:true,hasBal:true,
+  groupWord:'Month',hasSub:true,hasBal:true,hasProbable:true,
   label:{...COMMON_LABEL,duplicate:'Duplicate in CBS',onlyA:'Only in bank',onlyB:'Only in CBS'},
   note:{
     side:'Every bank statement row (File 1) lined up with its CBS GL row (File 2). Bank deposits pair with CBS debits, bank withdrawals with CBS credits. A dash means the row is in only one file.',
@@ -449,51 +487,7 @@ P.gibl={
   },
   prepA(r){bankInfo(r);r.ad=r.td;r.date=r.td},
   prepB(r){cbsInfo(r);r.date=r.bs},
-  match(A,B,ctx){
-    // pass 1: transaction ID
-    const byId=new Map();A.forEach(a=>{if(a.id)byId.set(a.id+'|'+a.dir,a)});
-    B.forEach(b=>{
-      for(const t of b.toks){const a=byId.get(t+'|'+b.dir);if(!a)continue;
-        if(a.st==='matched'||a.st==='mismatch'){const first=B[a.pair];if(first&&first!==b&&Math.abs(a.amt-b.amt)<0.005){b.st='duplicate';b.pair=a.i;b.orig=first.i;b.method='Same ID as CBS SN '+first.sn;break}continue}
-        link(b,a,Math.abs(a.amt-b.amt)<0.005?'matched':'mismatch','Transaction ID');break}
-    });
-    const pairs=[];B.forEach(b=>{if(b.st==='matched')pairs.push([b.bs,A[b.pair].td])});
-    const cal=buildCalendar(B,pairs);ctx.cal=cal;
-    B.forEach(b=>{b.ad=cal?cal.toAd(b.bs):''});
-    // pass 2: phone / reference token, same amount + dir, nearest date
-    const byTok=new Map();A.forEach(a=>{if(!a.st&&a.tok){const k=a.tok+'|'+a.dir+'|'+a.amt.toFixed(2);if(!byTok.has(k))byTok.set(k,[]);byTok.get(k).push(a)}});
-    B.forEach(b=>{if(b.st)return;const bd=dayNum(b.ad);
-      for(const t of b.toks){const l=byTok.get(t+'|'+b.dir+'|'+b.amt.toFixed(2));if(!l)continue;
-        let best=null,gap=Infinity;l.forEach(a=>{if(a.st)return;const g=bd==null?0:Math.abs(dayNum(a.td)-bd);if(g<gap){gap=g;best=a}});
-        if(best&&gap<=5){link(b,best,'matched','Phone / reference');b.gap=best.gap=gap;break}}
-    });
-    // pass 2b: bulk settlements (one bank credit = a day's CBS QR loads)
-    if(cal){
-      const qd=new Map();B.forEach(b=>{if(!b.st&&b.dir==='in'&&/QR load|SCT load/.test(b.cat)){const d=dayNum(b.ad);if(d==null)return;if(!qd.has(d))qd.set(d,[]);qd.get(d).push(b)}});
-      const wins=[[-1],[0],[-2],[-2,-1],[-3,-2,-1],[-1,0]];
-      A.filter(a=>!a.st&&a.dir==='in'&&/smart choice/i.test(a.desc)).sort((x,y)=>x.td<y.td?-1:1).forEach(a=>{const d=dayNum(a.td);
-        for(const w of wins){const mem=[];w.forEach(o=>(qd.get(d+o)||[]).forEach(b=>{if(!b.st)mem.push(b)}));if(!mem.length)continue;
-          const s=r2(mem.reduce((x,b)=>x+b.amt,0));
-          if(Math.abs(s-a.amt)<0.01){a.st='matched';a.method='Daily batch ('+mem.length+' CBS rows)';a.batch=mem.length;a.pair=mem[0].i;
-            mem.forEach(b=>{b.st='matched';b.pair=a.i;b.batch=true;b.method='In daily batch, bank S.N '+a.sn});break}}});
-    }
-    // pass 3: amount + direction within 1 day (probable)
-    if(cal){
-      const byAmt=new Map();A.forEach(a=>{if(!a.st&&a.cat!=='Sweep in (SI FROM)'&&a.cat!=='Sweep out (SI TO)'){const k=a.dir+'|'+a.amt.toFixed(2)+'|'+dayNum(a.td);if(!byAmt.has(k))byAmt.set(k,[]);byAmt.get(k).push(a)}});
-      B.forEach(b=>{if(b.st||b.cat==='Opening balance')return;const bd=dayNum(b.ad);if(bd==null)return;
-        for(const g of [0,1,-1]){const l=byAmt.get(b.dir+'|'+b.amt.toFixed(2)+'|'+(bd+g));const a=l&&l.find(x=>!x.st);if(a){link(b,a,'probable','Amount + date');b.gap=a.gap=Math.abs(g);break}}
-      });
-    }
-    // pass 4: large non-QR amounts within 7 days (probable)
-    if(cal){const big=A.filter(a=>!a.st&&a.amt>=100000&&!/Sweep/.test(a.cat));
-      B.forEach(b=>{if(b.st||b.amt<100000||b.cat==='Opening balance')return;const bd=dayNum(b.ad);if(bd==null)return;
-        let best=null,gap=99;big.forEach(a=>{if(a.st||a.dir!==b.dir||Math.abs(a.amt-b.amt)>0.005)return;const g=Math.abs(dayNum(a.td)-bd);if(g<=7&&g<gap){gap=g;best=a}});
-        if(best){link(b,best,'probable','Same large amount within '+gap+' day'+(gap===1?'':'s'));b.gap=best.gap=gap}});}
-    A.forEach(a=>{if(!a.st)a.st='onlyA'});B.forEach(b=>{if(!b.st)b.st='onlyB'});
-    // groups: BS month / day
-    A.forEach(a=>{const pb=a.pair>=0?B[a.pair]:null;a.bs=pb&&pb.bs?pb.bs:(cal?cal.toBs(a.td):'');a.g=a.bs?a.bs.slice(0,7):(a.td||'').slice(0,7);a.sub=a.bs||a.td});
-    B.forEach(b=>{b.g=b.bs.slice(0,7);b.sub=b.bs});
-  },
+  match(A,B,ctx){bankLedgerMatch(A,B,ctx,{batchRe:/smart choice/i})},
   groupLabel:g=>{const m=/^(\d{4})\/(\d{2})$/.exec(g);return m?`${m[1]} ${BSM[+m[2]-1]||m[2]}`:g},
   groupSort:(a,b)=>String(a).localeCompare(b),
   railSub:x=>x.first?(x.first.slice(5)+(x.last&&x.last!==x.first?' to '+x.last.slice(5):'')):'',
@@ -522,10 +516,213 @@ P.gibl={
   noteA:()=> '',
   titleA:a=>'Bank row '+a.sn, titleB:b=>'CBS SN '+b.sn
 };
+
+P.kbl={...P.gibl,
+  id:'kbl',title:'Kumari ↔ Coop ledger',aName:'Kumari Bank statement',bName:'Coop ledger (Kumari account)',aShort:'Kumari',bShort:'Coop ledger',
+  label:{...COMMON_LABEL,duplicate:'Duplicate in ledger',onlyA:'Only in bank',onlyB:'Only in Coop ledger'},
+  note:{
+    side:'Every Kumari Bank statement row (File 1) lined up with its Coop ledger row (File 2). Bank credits pair with ledger debits, bank debits with ledger credits. A dash means the row is in only one file.',
+    matched:'Paired on a reference number that appears in both files, with the same amount and direction.',
+    probable:'No shared reference, but the same amount and direction within one day (large amounts within 7 days). Confirm these.',
+    duplicate:'The ledger posted the same bank reference more than once.',
+    onlyA:'In the bank statement with no ledger entry. Call ↔ current sweeps are internal to the bank and are normally expected here.',
+    onlyB:'In the Coop ledger with no bank statement row.',
+    mismatch:'Paired, but the amounts differ. “Rounded amount” means the ledger posted a rounded figure (for example interest 108 vs 108.26).'
+  },
+  fieldsA:['sn','td','vd','desc','rem','dir','amt','bal','tid','acct'],
+  fieldsB:['sn','bs','ref','dir','amt','bal','vno'],
+  parseA(rows,hi){
+    const H=rows[hi].map(norm),ix=n=>H.indexOf(n);
+    const c={sn:ix('s no'),td:ix('tran date'),vd:ix('posted date'),val:ix('value date'),tid:ix('tran id'),desc:ix('tran desc'),part:ix('tran particular'),cr:ix('cr amt'),dr:ix('dr amt'),bal:ix('available amount'),acct:ix('acct no')};
+    const out=[];
+    rows.slice(hi+1).forEach(r=>{const cr=numv(r[c.cr]),dr=numv(r[c.dr]);if(!(cr>0)&&!(dr>0))return;
+      out.push([String(r[c.sn]==null?'':r[c.sn]),adDate(r[c.td])||adDate(r[c.val]),c.vd>=0?dtStr(r[c.vd]):'',String(r[c.part]||'').trim(),String(r[c.desc]||'').trim(),cr>0?'in':'out',r2(cr>0?cr:dr),numv(r[c.bal]),String(r[c.tid]||'').trim(),c.acct>=0?String(r[c.acct]||'').trim():'']);
+      if(cr>0&&dr>0)out.push([String(r[c.sn]==null?'':r[c.sn])+'b',adDate(r[c.td]),c.vd>=0?dtStr(r[c.vd]):'',String(r[c.part]||'').trim(),String(r[c.desc]||'').trim(),'out',r2(dr),numv(r[c.bal]),String(r[c.tid]||'').trim(),'']);
+    });
+    return out;
+  },
+  parseB(rows,hi){
+    const H=rows[hi].map(norm),ix=n=>H.indexOf(n);
+    const c={bs:ix('date'),vno:ix('v no'),ref:ix('particulars'),dr:ix('debit (dr)'),cr:ix('credit (cr)'),bal:ix('balance')};
+    const out=[];let n=0;
+    const bal=v=>{const s=String(v==null?'':v);const x=numv(s.replace(/\s*(dr|cr)\s*$/i,''));return /cr\s*$/i.test(s)?-x:x};
+    rows.slice(hi+1).forEach(r=>{const bs=String(r[c.bs]instanceof Date?adDate(r[c.bs]).replace(/-/g,'/'):(r[c.bs]||'')).trim();if(!/^\d{4}\/\d{2}\/\d{2}$/.test(bs))return;
+      const dr=numv(r[c.dr]),cr=numv(r[c.cr]);if(!(dr>0)&&!(cr>0))return;n++;
+      const ref=String(r[c.ref]||'').trim(),vno=String(r[c.vno]==null?'':r[c.vno]),b=bal(r[c.bal]);
+      if(dr>0)out.push([String(n),bs,ref,'in',r2(dr),b,vno]);
+      if(cr>0)out.push([String(n)+(dr>0?'b':''),bs,ref,'out',r2(cr),b,vno]);
+    });
+    return out;
+  },
+  prepA(r){kumariInfo(r);r.ad=r.td;r.date=r.td},
+  prepB(r){ledgerInfo(r);r.date=r.bs},
+  match(A,B,ctx){bankLedgerMatch(A,B,ctx,{})},
+  cols(tab,pa){
+    const cs=P.gibl.cols(tab,pa);
+    return cs.map(c=>{const h={'Bank description':'Bank particulars','Bank remarks':'Bank tran type','CBS SN':'Ledger row','CBS reference':'Ledger particulars','CBS amount':'Ledger amount','Description':'Particulars','Remarks':'Tran type','SN':'Row','Reference':'Particulars','Debit':'Debit (DR)','Credit':'Credit (CR)','Deposit':'Cr amt','Withdraw':'Dr amt'}[c.h];return h?{...c,h}:c});
+  },
+  aggs:{onlyA:{label:'By type',key:r=>r.cat+'|'+r.dir,cols:[['Type','cat'],['Direction','dir']]},onlyB:{label:'By type',key:r=>r.catG+'|'+r.dir,cols:[['Type','catG'],['Direction','dir']]}},
+  detailA:a=>[['Tran date',a.td],['Posted',a.vd],['BS date (est.)',a.bs],['S.No',a.sn],['Tran Id',a.tid],['Type',a.cat],['Tran desc',a.rem],['Particulars',a.desc],[a.dir==='in'?'Credit':'Debit',rs(a.amt)],['Available after',rs(a.bal||0)]],
+  cardB:b=>({title:'Ledger row '+b.sn,sub:`${b.bs} · voucher ${b.vno} · ${b.dir==='in'?'Debit (DR)':'Credit (CR)'} · ${b.cat}`,ref:b.ref,amt:b.amt,bal:b.bal}),
+  titleA:a=>'Bank S.No '+a.sn, titleB:b=>'Ledger row '+b.sn
+};
+
+/* ---------- NIC Asia system ledger vs mbank ledger ---------- */
+const zw=v=>String(v==null?'':v).replace(/[\u200b\u200c\u200d\ufeff]/g,'').trim();
+function selfReverse(arr,idOf){
+  const g=new Map();arr.forEach(r=>{if(r.st)return;const id=idOf(r);if(!id)return;if(!g.has(id))g.set(id,[]);g.get(id).push(r)});
+  g.forEach(l=>{if(l.length<2)return;l.sort((x,y)=>(x.time<y.time?-1:x.time>y.time?1:x.i-y.i));
+    l.forEach((r,k)=>{if(r.st)return;for(let j=k+1;j<l.length;j++){const o=l[j];if(!o.st&&o.dir!==r.dir&&Math.abs(o.amt-r.amt)<0.005){r.st=o.st='reversed';r.rev=o.i;o.rev=r.i;r.method=o.method='Credited and reversed';break}}})});
+}
+P.nicm={
+  id:'nicm',title:'NIC Asia system ↔ mbank',aName:'NIC Asia system ledger',bName:'NIC Asia mbank ledger',aShort:'System',bShort:'mbank',
+  groupWord:'Month',hasSub:true,hasBal:false,hasProbable:true,hasReversed:true,
+  label:{...COMMON_LABEL,duplicate:'Duplicate in mbank',onlyA:'Only in system',onlyB:'Only in mbank'},
+  note:{
+    side:'Every system ledger row (File 1) lined up with its mbank row (File 2), matched on the Fonepay transaction ID. System debits pair with mbank Cr, system credits with mbank Dr. A dash means the row is in only one file.',
+    matched:'Same transaction ID, same amount and direction in both ledgers.',
+    probable:'No shared transaction ID, but the same amount and direction on the same day (large amounts within 7 days). Confirm these.',
+    duplicate:'mbank shows this transaction ID more times (net of reversals) than the system ledger does.',
+    onlyA:'In the system ledger with no mbank entry.',
+    onlyB:'In mbank with no system ledger entry. Rows after the system statement ends, and cancelled payments, land here.',
+    mismatch:'Same transaction ID in both ledgers but the amounts differ.',
+    reversed:'mbank (or the system) credited a transaction and then reversed it with the same ID and amount. Each pair nets to zero; the final credit is matched separately.'
+  },
+  fieldsA:['bs','td','tt','seq','desc','dir','amt','bal'],
+  fieldsB:['dt','part','dir','amt','bal','tid','tst','dest','name','mobile'],
+  parseA(rows,hi){
+    const H=rows[hi].map(norm),ix=n=>H.indexOf(n);
+    const c={bs:ix('nep date'),td:ix('eng date'),tt:ix('tran type'),seq:ix('seq'),desc:ix('description'),dr:ix('debit'),cr:ix('credit'),bal:ix('balance')};
+    const out=[];
+    rows.slice(hi+1).forEach(r=>{const dr=numv(r[c.dr]),cr=numv(r[c.cr]);if(!(dr>0)&&!(cr>0))return;
+      let bs=r[c.bs]instanceof Date?adDate(r[c.bs]).replace(/-/g,'/'):String(r[c.bs]||'').trim();
+      let td=r[c.td]instanceof Date?adDate(r[c.td]):String(r[c.td]||'').trim().replace(/\//g,'-');
+      const base=[bs,td.slice(0,10),String(r[c.tt]||'').trim(),String(r[c.seq]==null?'':r[c.seq]),String(r[c.desc]||'').trim()];
+      if(dr>0)out.push(base.concat(['in',r2(dr),numv(r[c.bal])]));
+      if(cr>0)out.push(base.concat(['out',r2(cr),numv(r[c.bal])]));
+    });
+    return out;
+  },
+  parseB(rows,hi){
+    const H=rows[hi].map(norm),ix=n=>H.indexOf(n);
+    const c={dt:ix('date'),part:ix('particular'),dr:ix('dr'),cr:ix('cr'),bal:ix('balance'),tid:ix('transaction id'),tst:ix('tran status'),dest:ix('destination'),name:ix('name'),mobile:ix('mobile number')};
+    const out=[];
+    rows.slice(hi+1).forEach(r=>{const dr=numv(zw(r[c.dr])),cr=numv(zw(r[c.cr]));if(!(dr>0)&&!(cr>0))return;
+      const base=[dtStr(r[c.dt]),zw(r[c.part])];const tail=[numv(zw(r[c.bal])),zw(r[c.tid]),zw(r[c.tst]),zw(r[c.dest]),zw(r[c.name]),zw(r[c.mobile])];
+      if(cr>0)out.push(base.concat(['in',r2(cr)],tail));
+      if(dr>0)out.push(base.concat(['out',r2(dr)],tail));
+    });
+    return out;
+  },
+  prepA(r){r.ad=r.td;r.date=r.td;r.time=r.td+' '+String(r.seq).padStart(8,'0');r.ids=[...new Set((r.desc.match(/\d{15,}/g)||[]))];r.rev=-1;
+    r.cat=({AWDL:'QR settlement (AWDL)',ACRT:'Fonepay QR payment (ACRT)',JDBT:'Deposit from QR saving (JDBT)',JCRT:'Transfer / cheque out (JCRT)'})[r.tt]||(r.tt||'Other');
+    const m=/COMPLETE for .*? of (\d{15,})/i.exec(r.desc);r.refOf=m?m[1]:'';if(m)r.cat='Payment completion entry (COMPLETE for …)'},
+  prepB(r){r.ad=r.dt.slice(0,10);r.date=r.dt;r.time=r.dt;r.rev=-1;r.toks=new Set(r.tid?[r.tid]:[]);
+    r.cat=/QR Settlement/i.test(r.part)?'QR settlement':/Payment of Fonepay QR/i.test(r.part)?'Fonepay QR payment':'Other';
+    if(r.tst&&!/^complete$/i.test(r.tst))r.cat+=' ('+r.tst+')';r.catG=r.cat},
+  match(A,B,ctx){
+    selfReverse(B,r=>r.tid);selfReverse(A,r=>r.ids[0]);
+    const byId=new Map();A.forEach(a=>{if(a.st)return;a.ids.forEach(id=>{const k=id+'|'+a.dir;if(!byId.has(k))byId.set(k,[]);byId.get(k).push(a)})});
+    [...B].sort((x,y)=>x.time<y.time?-1:1).forEach(b=>{if(b.st||!b.tid)return;const l=byId.get(b.tid+'|'+b.dir);if(!l)return;
+      const a=l.find(x=>!x.st);
+      if(a){link(b,a,Math.abs(a.amt-b.amt)<0.005?'matched':'mismatch','Transaction ID');return}
+      const f=l[0];if(Math.abs(f.amt-b.amt)<0.005){b.st='duplicate';b.pair=f.i;b.orig=f.pair;b.method='Same ID as system seq '+f.seq}});
+    // BS mapping from system rows (exact Nep/Eng pairs)
+    const ad2bs=new Map();A.forEach(a=>{if(a.td&&a.bs&&!ad2bs.has(a.td))ad2bs.set(a.td,a.bs)});
+    const known=[...ad2bs.keys()].sort();
+    const toBs=ad=>{if(ad2bs.has(ad))return ad2bs.get(ad);if(!known.length||!ad)return '';const n=dayNum(ad);let best=known[0],bd=1e9;known.forEach(k=>{const d=Math.abs(dayNum(k)-n);if(d<bd){bd=d;best=k}});
+      const m=/^(\d{4})\/(\d{2})\/(\d{2})$/.exec(ad2bs.get(best));if(!m)return '';const day=+m[3]+(n-dayNum(best));return day>=1&&day<=32?`${m[1]}/${m[2]}/${pad(day)}`:(n>dayNum(best)?`${m[1]}/${m[2]}/32`:`${m[1]}/${m[2]}/01`)};
+    // probable: amount + dir same day, large within 7 days
+    const byAmt=new Map();A.forEach(a=>{if(a.st)return;const k=a.dir+'|'+a.amt.toFixed(2)+'|'+dayNum(a.td);if(!byAmt.has(k))byAmt.set(k,[]);byAmt.get(k).push(a)});
+    B.forEach(b=>{if(b.st)return;const bd=dayNum(b.ad);for(const g of [0,1,-1]){const l=byAmt.get(b.dir+'|'+b.amt.toFixed(2)+'|'+(bd+g));const a=l&&l.find(x=>!x.st);if(a){link(b,a,'probable','Amount + date');b.gap=a.gap=Math.abs(g);return}}});
+    const big=A.filter(a=>!a.st&&a.amt>=100000);
+    B.forEach(b=>{if(b.st||b.amt<100000)return;const bd=dayNum(b.ad);let best=null,gap=99;big.forEach(a=>{if(a.st||a.dir!==b.dir||Math.abs(a.amt-b.amt)>0.005)return;const g=Math.abs(dayNum(a.td)-bd);if(g<=7&&g<gap){gap=g;best=a}});if(best){link(b,best,'probable','Same large amount within '+gap+' days');b.gap=best.gap=gap}});
+    A.forEach(a=>{if(!a.st)a.st='onlyA'});B.forEach(b=>{if(!b.st)b.st='onlyB'});
+    A.forEach(a=>{a.g=a.bs.slice(0,7);a.sub=a.bs});
+    B.forEach(b=>{const pa=b.pair>=0&&(b.st==='matched'||b.st==='probable'||b.st==='mismatch')?A[b.pair]:null;b.bs=pa?pa.bs:toBs(b.ad);b.g=b.bs.slice(0,7);b.sub=b.bs});
+  },
+  groupLabel:g=>{const m=/^(\d{4})\/(\d{2})$/.exec(g);return m?`${m[1]} ${BSM[+m[2]-1]||m[2]}`:g},
+  groupSort:(a,b)=>String(a).localeCompare(b),
+  railSub:x=>x.first?(x.first.slice(5)+(x.last&&x.last!==x.first?' to '+x.last.slice(5):'')):'',
+  cols(tab,pa){
+    const T=(h,f,t,s)=>({h,f,t,s});const dirL=d=>d==='in'?'In':'Out';
+    return ({
+      side:[T('BS date',r=>r.sub),T('Result',r=>r.st,'tag'),T('Matched on',r=>r.method||''),
+        T('Eng date',r=>r.a?r.a.td:'',0,1),T('Type',r=>r.a?r.a.tt:'',0,1),T('Description',r=>r.a?r.a.desc:'',0,1),T('Debit',r=>r.a&&r.a.dir==='in'?r.a.amt:'','n',1),T('Credit',r=>r.a&&r.a.dir==='out'?r.a.amt:'','n',1),
+        T('Date / time',r=>r.b?r.b.dt:'',0,2),T('Transaction ID',r=>r.b?r.b.tid:'',0,2),T('Particular',r=>r.b?r.b.part:'',0,2),T('Cr',r=>r.b&&r.b.dir==='in'?r.b.amt:'','n',2),T('Dr',r=>r.b&&r.b.dir==='out'?r.b.amt:'','n',2),T('Status',r=>r.b?r.b.tst:'',0,2),
+        T('Difference',r=>r.diff,'nd')],
+      matched:[T('BS date',r=>r.bs),T('Eng date',r=>pa(r).td),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('Transaction ID',r=>r.tid),T('System type',r=>pa(r).tt),T('System description',r=>pa(r).desc),T('mbank time',r=>r.dt),T('mbank particular',r=>r.part),T('Name',r=>r.name)],
+      probable:[T('BS date',r=>r.bs),T('Eng date',r=>pa(r).td),T('Days apart',r=>r.gap,'n0'),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('System description',r=>pa(r).desc),T('mbank time',r=>r.dt),T('mbank particular',r=>r.part),T('mbank txn ID',r=>r.tid)],
+      mismatch:[T('BS date',r=>r.bs),T('Transaction ID',r=>r.tid),T('Direction',r=>dirL(r.dir)),T('mbank amount',r=>r.amt,'n'),T('System amount',r=>pa(r).amt,'n'),T('Difference',r=>r2(r.amt-pa(r).amt),'nd'),T('System description',r=>pa(r).desc),T('mbank particular',r=>r.part)],
+      duplicate:[T('BS date',r=>r.bs),T('mbank time',r=>r.dt),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('Transaction ID',r=>r.tid),T('Particular',r=>r.part),T('Status',r=>r.tst),T('Name',r=>r.name),T('Duplicate of',r=>r.method)],
+      onlyA:[T('BS date',r=>r.bs),T('Eng date',r=>r.td),T('Seq',r=>r.seq),T('Type',r=>r.cat),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('Description',r=>r.desc),T('Refers to txn',r=>r.refOf||''),T('Balance',r=>r.bal,'n')],
+      onlyB:[T('BS date (est.)',r=>r.bs),T('Date / time',r=>r.dt),T('Type',r=>r.catG),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('Transaction ID',r=>r.tid),T('Particular',r=>r.part),T('Status',r=>r.tst),T('Name',r=>r.name),T('Mobile',r=>r.mobile)],
+      reversed:[T('Ledger',r=>r.side==='A'?'System':'mbank'),T('BS date',r=>r.bs),T('Date / time',r=>r.side==='A'?r.td:r.dt),T('Direction',r=>dirL(r.dir)),T('Amount',r=>r.amt,'n'),T('Transaction ID',r=>r.side==='A'?r.ids[0]:r.tid),T('Particular',r=>r.side==='A'?r.desc:r.part),T('Reversed by',r=>{const o=(r.side==='A'?D.A:D.B)[r.rev];return o?(o.dt||o.td)+' '+(o.dir==='in'?'Cr':'Dr'):''}),T('Name',r=>r.name||'')]
+    })[tab];
+  },
+  aggs:{onlyA:{label:'By type',key:r=>r.cat+'|'+r.dir,cols:[['Type','cat'],['Direction','dir']]},onlyB:{label:'By type',key:r=>r.catG+'|'+r.dir,cols:[['Type','catG'],['Direction','dir']]},
+        reversed:{label:'By member',key:r=>(r.name||'System')+'|'+r.dir,cols:[['Name','name'],['Direction','dir']]}},
+  anchorFor:b=>D.A.find(x=>x.ids.includes(b.tid))||null,
+  detailA:a=>[['BS date',a.bs],['Eng date',a.td],['Tran type',a.tt],['Seq',a.seq],['Type',a.cat],['Description',a.desc],['Transaction ID',a.ids[0]||'—'],['Refers to txn',a.refOf||'—'],[a.dir==='in'?'Debit':'Credit',rs(a.amt)],['Balance after',rs(a.bal||0)]],
+  cardB:b=>({title:b.dt+' · '+(b.dir==='in'?'Cr':'Dr'),sub:`${b.tid} · ${b.tst||'—'} · ${b.name||''} ${b.mobile||''}`,ref:b.part,amt:b.amt,bal:b.bal}),
+  relatedB:(anchor,b)=>{const id=b?b.tid:(anchor&&(anchor.refOf||anchor.ids[0]));return id?D.B.filter(x=>x.tid===id):[]},
+  noteA:a=>a.refOf?'This system entry refers to the earlier QR payment '+a.refOf+'. The system ledger records the payment and then this completion entry, so the pair nets to zero in the system while mbank shows only the payment.':'',
+  titleA:a=>'System seq '+a.seq+' ('+a.td+')', titleB:b=>'mbank '+b.tid
+};
+function bankLedgerMatch(A,B,ctx,o){
+    const byId=new Map();A.forEach(a=>{(a.ids||[]).forEach(id=>{if(!byId.has(id+'|'+a.dir))byId.set(id+'|'+a.dir,a)})});
+    B.forEach(b=>{
+      for(const t of b.toks){const a=byId.get(t+'|'+b.dir);if(!a)continue;
+        if(a.st==='matched'||a.st==='mismatch'){const first=B[a.pair];if(first&&first!==b&&Math.abs(a.amt-b.amt)<0.005){b.st='duplicate';b.pair=a.i;b.orig=first.i;b.method='Same ID as CBS SN '+first.sn;break}continue}
+        link(b,a,Math.abs(a.amt-b.amt)<0.005?'matched':'mismatch','Transaction ID');break}
+    });
+    const pairs=[];B.forEach(b=>{if(b.st==='matched')pairs.push([b.bs,A[b.pair].td])});
+    const cal=buildCalendar(B,pairs);ctx.cal=cal;
+    B.forEach(b=>{b.ad=cal?cal.toAd(b.bs):''});
+    // pass 2: phone / reference token, same amount + dir, nearest date
+    const byTok=new Map();A.forEach(a=>{if(!a.st&&a.tok){const k=a.tok+'|'+a.dir+'|'+a.amt.toFixed(2);if(!byTok.has(k))byTok.set(k,[]);byTok.get(k).push(a)}});
+    B.forEach(b=>{if(b.st)return;const bd=dayNum(b.ad);
+      for(const t of b.toks){const l=byTok.get(t+'|'+b.dir+'|'+b.amt.toFixed(2));if(!l)continue;
+        let best=null,gap=Infinity;l.forEach(a=>{if(a.st)return;const g=bd==null?0:Math.abs(dayNum(a.td)-bd);if(g<gap){gap=g;best=a}});
+        if(best&&gap<=5){link(b,best,'matched','Phone / reference');b.gap=best.gap=gap;break}}
+    });
+    // pass 2b: bulk settlements (one bank credit = a day's CBS QR loads)
+    if(cal&&o.batchRe){
+      const qd=new Map();B.forEach(b=>{if(!b.st&&b.dir==='in'&&/QR load|SCT load/.test(b.cat)){const d=dayNum(b.ad);if(d==null)return;if(!qd.has(d))qd.set(d,[]);qd.get(d).push(b)}});
+      const wins=[[-1],[0],[-2],[-2,-1],[-3,-2,-1],[-1,0]];
+      A.filter(a=>!a.st&&a.dir==='in'&&o.batchRe&&o.batchRe.test(a.desc)).sort((x,y)=>x.td<y.td?-1:1).forEach(a=>{const d=dayNum(a.td);
+        for(const w of wins){const mem=[];w.forEach(o=>(qd.get(d+o)||[]).forEach(b=>{if(!b.st)mem.push(b)}));if(!mem.length)continue;
+          const s=r2(mem.reduce((x,b)=>x+b.amt,0));
+          if(Math.abs(s-a.amt)<0.01){a.st='matched';a.method='Daily batch ('+mem.length+' CBS rows)';a.batch=mem.length;a.pair=mem[0].i;
+            mem.forEach(b=>{b.st='matched';b.pair=a.i;b.batch=true;b.method='In daily batch, bank S.N '+a.sn});break}}});
+    }
+    // pass 3: amount + direction within 1 day (probable)
+    if(cal){
+      const byAmt=new Map();A.forEach(a=>{if(!a.st&&a.cat!=='Sweep in (SI FROM)'&&a.cat!=='Sweep out (SI TO)'){const k=a.dir+'|'+a.amt.toFixed(2)+'|'+dayNum(a.td);if(!byAmt.has(k))byAmt.set(k,[]);byAmt.get(k).push(a)}});
+      B.forEach(b=>{if(b.st||b.cat==='Opening balance')return;const bd=dayNum(b.ad);if(bd==null)return;
+        for(const g of [0,1,-1]){const l=byAmt.get(b.dir+'|'+b.amt.toFixed(2)+'|'+(bd+g));const a=l&&l.find(x=>!x.st);if(a){link(b,a,'probable','Amount + date');b.gap=a.gap=Math.abs(g);break}}
+      });
+    }
+    // pass 4: large non-QR amounts within 7 days (probable)
+    if(cal){const big=A.filter(a=>!a.st&&a.amt>=100000&&!/Sweep/.test(a.cat));
+      B.forEach(b=>{if(b.st||b.amt<100000||b.cat==='Opening balance')return;const bd=dayNum(b.ad);if(bd==null)return;
+        let best=null,gap=99;big.forEach(a=>{if(a.st||a.dir!==b.dir||Math.abs(a.amt-b.amt)>0.005)return;const g=Math.abs(dayNum(a.td)-bd);if(g<=7&&g<gap){gap=g;best=a}});
+        if(best){link(b,best,'probable','Same large amount within '+gap+' day'+(gap===1?'':'s'));b.gap=best.gap=gap}});}
+    // pass 5: rounded amounts (difference under Rs 1) within 3 days
+    if(cal){const bk=new Map();B.forEach(b=>{if(b.st||b.cat==='Opening balance'||dayNum(b.ad)==null)return;const k=b.dir+'|'+Math.floor(b.amt);if(!bk.has(k))bk.set(k,[]);bk.get(k).push(b)});
+      A.forEach(a=>{if(a.st||/Sweep/.test(a.cat))return;const ad=dayNum(a.td);if(ad==null)return;let best=null,sc=1e9,gp=0;
+        for(const f of [Math.floor(a.amt)-1,Math.floor(a.amt),Math.floor(a.amt)+1])(bk.get(a.dir+'|'+f)||[]).forEach(b=>{if(b.st)return;const df=Math.abs(a.amt-b.amt);if(df<0.005||df>=1)return;const g=Math.abs(dayNum(b.ad)-ad);if(g>3)return;const s2=g*10+df;if(s2<sc){sc=s2;best=b;gp=g}});
+        if(best){link(best,a,'mismatch','Rounded amount, '+gp+' day'+(gp===1?'':'s')+' apart');best.gap=a.gap=gp}})}
+    A.forEach(a=>{if(!a.st)a.st='onlyA'});B.forEach(b=>{if(!b.st)b.st='onlyB'});
+    // groups: BS month / day
+    A.forEach(a=>{const pb=a.pair>=0?B[a.pair]:null;a.bs=pb&&pb.bs?pb.bs:(cal?cal.toBs(a.td):'');a.g=a.bs?a.bs.slice(0,7):(a.td||'').slice(0,7);a.sub=a.bs||a.td});
+    B.forEach(b=>{b.g=b.bs.slice(0,7);b.sub=b.bs});
+  
+}
 function link(b,a,st,method){b.st=st;a.st=st;b.pair=a.i;a.pair=b.i;b.method=a.method=method}
 
 /* ================= state ================= */
-const DS={nic:{A:null,B:null},gibl:{A:null,B:null}}; // {name, rows(raw arrays)}
+const DS={nic:{A:null,B:null},gibl:{A:null,B:null},kbl:{A:null,B:null},nicm:{A:null,B:null}}; // {name, rows(raw arrays)}
 let cur='nic', D=null, S=null, GROUPS=[];
 const view={g:null,sub:null,tab:'side',q:'',page:0,agg:false,sideMode:'all'};
 const PAGE=100;
@@ -535,7 +732,7 @@ const rvKey=g=>cur+':'+g;
 const savedTheme=store.get('recon-theme',null);if(savedTheme)document.documentElement.dataset.theme=savedTheme;
 $('#themeBtn').onclick=()=>{const c=document.documentElement.dataset.theme||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');const n=c==='dark'?'light':'dark';document.documentElement.dataset.theme=n;store.set('recon-theme',n)};
 
-function unpack(fields,rows,side){return rows.map((a,i)=>{const o={i,side,st:null,pair:-1,orig:-1,method:'',gap:null};fields.forEach((f,j)=>o[f]=a[j]);return o})}
+function unpack(fields,rows,side){return rows.map((a,i)=>{const o={i,side,st:null,pair:-1,orig:-1,rev:-1,method:'',gap:null};fields.forEach((f,j)=>o[f]=a[j]);return o})}
 
 function reconcile(){
   const p=P[cur],ds=DS[cur];
@@ -545,10 +742,10 @@ function reconcile(){
   const ctx={};p.match(A,B,ctx);
   D={A,B,p,ctx};
   S=new Map();
-  const sm=()=>({nA:0,nB:0,aIn:0,aOut:0,bIn:0,bOut:0,cA:{},cB:{},mA:{},mB:{},first:null,last:null,subs:null});
+  const sm=()=>({batchB:0,nA:0,nB:0,aIn:0,aOut:0,bIn:0,bOut:0,cA:{},cB:{},mA:{},mB:{},first:null,last:null,subs:null});
   const add=(x,r,side)=>{const s=r.dir==='in'?r.amt:-r.amt;
     if(side==='A'){x.nA++;if(r.dir==='in')x.aIn+=r.amt;else x.aOut+=r.amt;x.cA[r.st]=(x.cA[r.st]||0)+1;x.mA[r.st]=(x.mA[r.st]||0)+s}
-    else{x.nB++;if(r.dir==='in')x.bIn+=r.amt;else x.bOut+=r.amt;x.cB[r.st]=(x.cB[r.st]||0)+1;x.mB[r.st]=(x.mB[r.st]||0)+s}
+    else{x.nB++;if(r.batch)x.batchB++;if(r.dir==='in')x.bIn+=r.amt;else x.bOut+=r.amt;x.cB[r.st]=(x.cB[r.st]||0)+1;x.mB[r.st]=(x.mB[r.st]||0)+s}
     if(r.ad){if(!x.first||r.ad<x.first)x.first=r.ad;if(!x.last||r.ad>x.last)x.last=r.ad}};
   const tot=sm();
   const put=(r,side)=>{if(!S.has(r.g))S.set(r.g,sm());const x=S.get(r.g);add(x,r,side);add(tot,r,side);
@@ -557,7 +754,8 @@ function reconcile(){
   const fin=x=>{x.aNet=r2(x.aIn-x.aOut);x.bNet=r2(x.bIn-x.bOut);x.diff=r2(x.bNet-x.aNet);
     const c=k=>(x.cA[k]||0)+(k==='onlyA'?0:0);
     x.n={matched:x.cB.matched||0,probable:x.cB.probable||0,mismatch:x.cB.mismatch||0,duplicate:x.cB.duplicate||0,onlyA:x.cA.onlyA||0,onlyB:x.cB.onlyB||0};
-    x.n.side=x.nA+x.n.duplicate+x.n.onlyB;
+    x.n.reversed=(x.cA.reversed||0)+(x.cB.reversed||0);
+    x.n.side=x.nA+x.nB-((x.cB.matched||0)-x.batchB)-(x.cB.probable||0)-(x.cB.mismatch||0);
     x.issues=x.n.duplicate+x.n.onlyA+x.n.onlyB+x.n.mismatch;
     x.amt={duplicate:x.mB.duplicate||0,onlyA:x.mA.onlyA||0,onlyB:x.mB.onlyB||0,mismatch:r2((x.mB.mismatch||0)-(x.mA.mismatch||0)),probable:r2((x.mB.probable||0)-(x.mA.probable||0))};
     if(x.subs)x.subs.forEach(fin)};
@@ -565,13 +763,14 @@ function reconcile(){
   GROUPS=[...S.keys()].sort(p.groupSort);
   if(p.hasBal){
     const lastBal=(arr,cmp)=>{let best=null;arr.forEach(r=>{if(isFinite(r.bal)&&(best==null||cmp(r,best)>0))best=r});return best};
-    const la=lastBal(A,(x,y)=>(+x.sn||0)-(+y.sn||0)),lb=lastBal(B,(x,y)=>(+x.sn||0)-(+y.sn||0));
-    tot.closeA=la?la.bal:null;tot.closeB=lb?lb.bal:null;tot.closeAd=la?la.td:'';tot.closeBs=lb?lb.bs:'';
+    const cmpA=(x,y)=>(x.td<y.td?-1:x.td>y.td?1:0)||(x.vd<y.vd?-1:x.vd>y.vd?1:0)||((parseFloat(x.sn)||0)-(parseFloat(y.sn)||0)),cmpB=(x,y)=>(x.bs<y.bs?-1:x.bs>y.bs?1:0)||((parseFloat(x.sn)||0)-(parseFloat(y.sn)||0));
+    const la=lastBal(A,cmpA),lb=lastBal(B,cmpB);
+    tot.closeA=la?la.bal:null;tot.closeB=lb?lb.bal:null;tot.acctA=(A.find(r=>r.acct)||{}).acct||'';tot.closeAd=la?la.td:'';tot.closeBs=lb?lb.bs:'';
   }
 }
 
 /* ================= rendering ================= */
-const COL={side:'var(--brand)',matched:'var(--ok)',probable:'var(--prob)',duplicate:'var(--dup)',onlyA:'var(--miss)',onlyB:'var(--only)',mismatch:'var(--diff)'};
+const COL={reversed:'var(--muted)',side:'var(--brand)',matched:'var(--ok)',probable:'var(--prob)',duplicate:'var(--dup)',onlyA:'var(--miss)',onlyB:'var(--only)',mismatch:'var(--diff)'};
 function statusOf(x){
   if(!x.nA)return {cls:'bad',txt:'No '+D.p.aShort+' rows'};
   if(!x.nB)return {cls:'bad',txt:'No '+D.p.bShort+' rows'};
@@ -617,11 +816,12 @@ const inScope=r=>(view.g==null||r.g===view.g)&&(!view.sub||r.sub===view.sub);
 function rowsFor(tab){
   const {A,B}=D;
   if(tab==='onlyA')return A.filter(r=>inScope(r)&&r.st==='onlyA');
+  if(tab==='reversed')return A.filter(r=>inScope(r)&&r.st==='reversed').concat(B.filter(r=>inScope(r)&&r.st==='reversed'));
   if(tab==='side'){
     const out=[];const ord={matched:0,probable:1,mismatch:2,duplicate:3,onlyA:4,onlyB:5};
-    A.forEach(a=>{if(!inScope(a))return;if(a.batch){out.push({g:a.g,sub:a.sub||a.g,st:a.st,a,b:null,method:a.method,diff:0});return}const b=a.pair>=0?B[a.pair]:null;out.push({g:a.g,sub:a.sub||a.g,st:a.st,a,b,method:a.method,diff:r2((b?(b.dir==='in'?b.amt:-b.amt):0)-(a.dir==='in'?a.amt:-a.amt))})});
-    B.forEach(b=>{if(b.batch&&inScope(b)){out.push({g:b.g,sub:b.sub||b.g,st:b.st,a:null,b,method:b.method,diff:0});return}if(!inScope(b)||(b.st!=='duplicate'&&b.st!=='onlyB'))return;out.push({g:b.g,sub:b.sub||b.g,st:b.st,a:null,b,method:b.method,diff:b.dir==='in'?b.amt:-b.amt,dupOf:b.pair})});
-    const sk=r=>{const x=r.a||r.b;return (cur==='nic'?String(x.g).padStart(8,'0')+'|'+x.ini+'|'+String(x.amt).padStart(12,'0'):(r.sub||'')+'|'+String(r.a?r.a.sn:'').padStart(8,'0')+'|'+String(r.b?r.b.sn:'').padStart(8,'0'))};
+    A.forEach(a=>{if(!inScope(a))return;if(a.st==='reversed'){out.push({g:a.g,sub:a.sub||a.g,st:'reversed',a,b:null,method:a.method,diff:0});return}if(a.batch){out.push({g:a.g,sub:a.sub||a.g,st:a.st,a,b:null,method:a.method,diff:0});return}const b=a.pair>=0?B[a.pair]:null;out.push({g:a.g,sub:a.sub||a.g,st:a.st,a,b,method:a.method,diff:r2((b?(b.dir==='in'?b.amt:-b.amt):0)-(a.dir==='in'?a.amt:-a.amt))})});
+    B.forEach(b=>{if(b.batch&&inScope(b)){out.push({g:b.g,sub:b.sub||b.g,st:b.st,a:null,b,method:b.method,diff:0});return}if(!inScope(b)||(b.st!=='duplicate'&&b.st!=='onlyB'&&b.st!=='reversed'))return;out.push({g:b.g,sub:b.sub||b.g,st:b.st,a:null,b,method:b.method,diff:b.st==='reversed'?0:(b.dir==='in'?b.amt:-b.amt),dupOf:b.pair})});
+    const sk=r=>{const x=r.a||r.b;return (cur==='nicm'?(r.sub||'')+'|'+((r.b&&r.b.time)||(r.a&&r.a.time)||''):cur==='nic'?String(x.g).padStart(8,'0')+'|'+x.ini+'|'+String(x.amt).padStart(12,'0'):(r.sub||'')+'|'+String(r.a?r.a.sn:'').padStart(8,'0')+'|'+String(r.b?r.b.sn:'').padStart(8,'0'))};
     out.forEach(r=>r.sk=sk(r));
     out.sort((x,y)=>x.sk<y.sk?-1:x.sk>y.sk?1:(ord[x.st]-ord[y.st]));
     return view.sideMode==='diff'?out.filter(r=>r.st!=='matched'):out;
@@ -667,6 +867,9 @@ function renderMain(){
   if(x.n.onlyA)parts.push(`${nfi.format(x.n.onlyA)} ${lc(p.label.onlyA)} (net ${rsSigned(x.amt.onlyA)})`);
   if(x.n.onlyB)parts.push(`${nfi.format(x.n.onlyB)} ${lc(p.label.onlyB)} (net ${rsSigned(x.amt.onlyB)})`);
   if(x.n.mismatch)parts.push(`${nfi.format(x.n.mismatch)} amount differences`);
+  if(x.n.reversed)parts.push(`${nfi.format(x.n.reversed)} rows are credit-and-reversal pairs that net to zero`);
+  const ac1=DS[cur].A.acct,ac2=DS[cur].B.acct;
+  if(ac1&&ac2&&ac1!==ac2)h+=`<div class="verdict bad"><b>These files are for different accounts.</b><p>File 1 is account ${esc(ac1)} and File 2 is account ${esc(ac2)}. Line-by-line matching will mostly fail until you load the statement for the same account as the ledger.</p></div>`;
   h+=`<div class="verdict ${vcls}"><b>${vt}</b><p>${parts.length?parts.join('; ')+'.':'Nothing to correct here.'}</p></div>`;
 
   if(g!=null){const rv=reviews[rvKey(g)]||{};h+=`<div class="review"><label><input type="checkbox" id="rvDone" ${rv.done?'checked':''}> Mark ${esc(p.groupWord.toLowerCase())} reviewed</label><input type="text" id="rvNote" placeholder="Note (saved in this browser)" value="${esc(rv.note||'')}">${rv.at?`<span class="muted" style="font-size:12px">Updated ${esc(new Date(rv.at).toLocaleString())}</span>`:''}</div>`}
@@ -679,11 +882,11 @@ function renderMain(){
     <div class="card"><div class="t">File 2 · ${esc(p.bShort)} net</div><div class="v">${rs(x.bNet)}</div><div class="s">${nfi.format(x.nB)} rows · ${io(x.bIn,x.bOut)}</div></div>
     <div class="card bridgecard bridge"><div class="t" style="margin-bottom:6px">Where the difference comes from (in − out)</div>
       <div class="row"><span>${esc(p.aShort)} net</span><span class="num">${nf.format(x.aNet)}</span></div>
-      ${bline(COL.duplicate,p.label.duplicate,x.amt.duplicate)}${bline(COL.onlyB,'Add '+lc(p.label.onlyB),x.amt.onlyB)}${bline(COL.onlyA,'Less '+lc(p.label.onlyA),-x.amt.onlyA)}${bline(COL.mismatch,'Amount differences',x.amt.mismatch)}${p.id==='gibl'?bline(COL.probable,'Probable matches',x.amt.probable):''}
+      ${bline(COL.duplicate,p.label.duplicate,x.amt.duplicate)}${bline(COL.onlyB,'Add '+lc(p.label.onlyB),x.amt.onlyB)}${bline(COL.onlyA,'Less '+lc(p.label.onlyA),-x.amt.onlyA)}${bline(COL.mismatch,'Amount differences',x.amt.mismatch)}${p.hasProbable?bline(COL.probable,'Probable matches',x.amt.probable):''}
       <div class="row tot"><span>${esc(p.bShort)} net</span><span class="num">${nf.format(x.bNet)}</span></div>
       <div class="row"><span class="muted">Net difference</span><span class="num ${Math.abs(x.diff)>0.004?'c-miss':'c-ok'}">${rsSigned(x.diff)}</span></div></div></div>`;
   if(p.hasBal&&g==null&&S.total.closeA!=null){const t=S.total,d=r2(t.closeB-t.closeA);
-    h+=`<div class="card" style="margin-bottom:18px"><div class="t">Closing balance check</div><div class="bridge" style="margin-top:6px"><div class="row"><span>Bank statement balance (${esc(t.closeAd)})</span><span class="num">${nf.format(t.closeA)}</span></div><div class="row"><span>CBS GL balance (${esc(t.closeBs)})</span><span class="num">${nf.format(t.closeB)}</span></div><div class="row tot"><span>CBS minus bank</span><span class="num ${Math.abs(d)>0.004?'c-miss':'c-ok'}">${rsSigned(d)}</span></div></div></div>`}
+    h+=`<div class="card" style="margin-bottom:18px"><div class="t">Closing balance check</div><div class="bridge" style="margin-top:6px"><div class="row"><span>Bank statement balance (${esc(t.closeAd)})</span><span class="num">${nf.format(t.closeA)}</span></div><div class="row"><span>${esc(p.bShort)} balance (${esc(t.closeBs)})</span><span class="num">${nf.format(t.closeB)}</span></div><div class="row tot"><span>${esc(p.bShort)} minus ${esc(p.aShort)}</span><span class="num ${Math.abs(d)>0.004?'c-miss':'c-ok'}">${rsSigned(d)}</span></div></div></div>`}
 
   // summary table
   const rowsSum=[];
@@ -691,13 +894,13 @@ function renderMain(){
   else if(p.hasSub&&S.get(g).subs&&!view.sub)[...S.get(g).subs.keys()].sort().forEach(k=>rowsSum.push([k,k,S.get(g).subs.get(k),'s']));
   if(rowsSum.length){
     const z=(n,c)=>n?`<span class="${c}">${nfi.format(n)}</span>`:'<span class="zero">0</span>';
-    h+=`<div class="section-title">${g==null?p.groupWord+' summary':'Day by day'}</div><div class="tablewrap"><table><thead><tr><th>${g==null?p.groupWord:'BS date'}</th><th>Status</th><th class="num">${esc(p.aShort)} rows</th><th class="num">${esc(p.aShort)} net</th><th class="num">${esc(p.bShort)} rows</th><th class="num">${esc(p.bShort)} net</th><th class="num">Matched</th>${p.id==='gibl'?'<th class="num">Probable</th>':''}<th class="num">Duplicates</th><th class="num">${esc(p.label.onlyA)}</th><th class="num">${esc(p.label.onlyB)}</th><th class="num">Amt diff</th><th class="num">Net difference</th>${g==null?'<th>Review</th>':''}</tr></thead><tbody>`;
+    h+=`<div class="section-title">${g==null?p.groupWord+' summary':'Day by day'}</div><div class="tablewrap"><table><thead><tr><th>${g==null?p.groupWord:'BS date'}</th><th>Status</th><th class="num">${esc(p.aShort)} rows</th><th class="num">${esc(p.aShort)} net</th><th class="num">${esc(p.bShort)} rows</th><th class="num">${esc(p.bShort)} net</th><th class="num">Matched</th>${p.hasProbable?'<th class="num">Probable</th>':''}<th class="num">Duplicates</th><th class="num">${esc(p.label.onlyA)}</th><th class="num">${esc(p.label.onlyB)}</th><th class="num">Amt diff</th><th class="num">Net difference</th>${g==null?'<th>Review</th>':''}</tr></thead><tbody>`;
     rowsSum.forEach(([k,lab,y,kind])=>{const st=statusOf(y),rv=kind==='g'?reviews[rvKey(k)]:null;
-      h+=`<tr data-${kind}="${esc(k)}"><td><b>${esc(lab)}</b></td><td><span class="pill ${st.cls}">${st.txt}</span></td><td class="num">${nfi.format(y.nA)}</td><td class="num">${nf.format(y.aNet)}</td><td class="num">${nfi.format(y.nB)}</td><td class="num">${nf.format(y.bNet)}</td><td class="num">${z(y.n.matched,'c-ok')}</td>${p.id==='gibl'?`<td class="num">${z(y.n.probable,'c-prob')}</td>`:''}<td class="num">${z(y.n.duplicate,'c-dup')}</td><td class="num">${z(y.n.onlyA,'c-miss')}</td><td class="num">${z(y.n.onlyB,'c-only')}</td><td class="num">${z(y.n.mismatch,'c-diff')}</td><td class="num ${Math.abs(y.diff)>0.004?'c-miss':'c-ok'}">${rsSigned(y.diff)}</td>${kind==='g'?`<td>${rv&&rv.done?'<span class="pill rev">Reviewed</span>':'<span class="muted">Pending</span>'}</td>`:''}</tr>`});
+      h+=`<tr data-${kind}="${esc(k)}"><td><b>${esc(lab)}</b></td><td><span class="pill ${st.cls}">${st.txt}</span></td><td class="num">${nfi.format(y.nA)}</td><td class="num">${nf.format(y.aNet)}</td><td class="num">${nfi.format(y.nB)}</td><td class="num">${nf.format(y.bNet)}</td><td class="num">${z(y.n.matched,'c-ok')}</td>${p.hasProbable?`<td class="num">${z(y.n.probable,'c-prob')}</td>`:''}<td class="num">${z(y.n.duplicate,'c-dup')}</td><td class="num">${z(y.n.onlyA,'c-miss')}</td><td class="num">${z(y.n.onlyB,'c-only')}</td><td class="num">${z(y.n.mismatch,'c-diff')}</td><td class="num ${Math.abs(y.diff)>0.004?'c-miss':'c-ok'}">${rsSigned(y.diff)}</td>${kind==='g'?`<td>${rv&&rv.done?'<span class="pill rev">Reviewed</span>':'<span class="muted">Pending</span>'}</td>`:''}</tr>`});
     h+=`</tbody></table></div>`;
   }
 
-  const tabs=['side','onlyA','onlyB','duplicate','mismatch'].concat(p.id==='gibl'?['probable']:[]).concat(['matched']);
+  const tabs=['side','onlyA','onlyB','duplicate','mismatch'].concat(p.hasProbable?['probable']:[]).concat(p.hasReversed?['reversed']:[]).concat(['matched']);
   if(!tabs.includes(view.tab))view.tab='side';
   h+=`<div class="tabs" role="tablist">${tabs.map(k=>`<button class="tab" role="tab" data-t="${k}" aria-selected="${view.tab===k}"><span class="dot" style="background:${COL[k]}"></span>${esc(p.label[k])}<span class="n">${nfi.format(x.n[k]||0)}</span></button>`).join('')}</div>`;
   h+=`<p class="tabnote">${esc(p.note[view.tab])}</p>`;
@@ -747,8 +950,9 @@ function renderList(){
 /* ================= drawer ================= */
 function openDrawer(a,b){
   const p=D.p;
-  const anchor=a||(b&&b.pair>=0?D.A[b.pair]:null);
-  let related=anchor?D.B.filter(x=>x.pair===anchor.i):[];
+  const anchor=a||(b&&b.pair>=0?D.A[b.pair]:(b&&p.anchorFor?p.anchorFor(b):null));
+  let related=p.relatedB?p.relatedB(anchor,b):(anchor?D.B.filter(x=>x.pair===anchor.i):[]);
+  if(b&&b.rev>=0&&!related.includes(D.B[b.rev]))related.push(D.B[b.rev]);
   if(b&&!related.includes(b))related.push(b);
   related.sort((x,y)=>x.i-y.i);
   const head=b||a;
@@ -774,7 +978,7 @@ $('#lookupForm').onsubmit=e=>{e.preventDefault();const v=$('#lookupInput').value
   if(!v){openGroup(null);return}
   if(S.has(v)){openGroup(v);$('#lookupInput').value='';return}
   const m=/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})$/.exec(v);
-  if(m&&cur==='gibl'){const bs=m[1]+'/'+pad(m[2])+'/'+pad(m[3]);const g=bs.slice(0,7);if(S.has(g)&&S.get(g).subs.has(bs)){openGroup(g,bs);$('#lookupInput').value='';return}}
+  if(m&&P[cur].hasSub){const bs=m[1]+'/'+pad(m[2])+'/'+pad(m[3]);const g=bs.slice(0,7);if(S.has(g)&&S.get(g).subs.has(bs)){openGroup(g,bs);$('#lookupInput').value='';return}}
   const m2=/^(\d{4})[\/-](\d{1,2})$/.exec(v);if(m2){const g=m2[1]+'/'+pad(m2[2]);if(S.has(g)){openGroup(g);$('#lookupInput').value='';return}}
   toast(`${v} is not in either file.`)};
 
@@ -804,7 +1008,7 @@ function exportXLSX(){
   ids.forEach(k=>{const y=S.get(k),rv=reviews[rvKey(k)]||{};sum.push([p.id==='nic'?k:p.groupLabel(k),y.nA,y.aNet,y.nB,y.bNet,y.n.matched,y.n.probable,y.n.duplicate,y.n.onlyA,y.n.onlyB,y.n.mismatch,y.diff,rv.done?'Yes':'No',rv.note||''])});
   const ws=XLSX.utils.aoa_to_sheet(sum);ws['!cols']=sum[0].map(()=>({wch:16}));XLSX.utils.book_append_sheet(wb,ws,'Summary');
   const saved={tab:view.tab,agg:view.agg,q:view.q,sideMode:view.sideMode};view.q='';view.sideMode='all';
-  const tabs=['side','onlyA','onlyB','duplicate','mismatch'].concat(p.id==='gibl'?['probable']:[]).concat(['matched']);
+  const tabs=['side','onlyA','onlyB','duplicate','mismatch'].concat(p.hasProbable?['probable']:[]).concat(p.hasReversed?['reversed']:[]).concat(['matched']);
   tabs.forEach(t=>{view.tab=t;view.agg=false;const {rows,cols}=currentList();if(!rows.length&&t!=='side')return;
     const aoa=[cols.map(hdr)].concat(rows.map(r=>cols.map(c=>cellOut(c,r))));const w=XLSX.utils.aoa_to_sheet(aoa);w['!cols']=cols.map(()=>({wch:16}));XLSX.utils.book_append_sheet(wb,w,p.label[t].slice(0,31));
     if(p.aggs[t]){view.agg=true;const g2=currentList();const a2=[g2.cols.map(hdr)].concat(g2.rows.map(r=>g2.cols.map(c=>cellOut(c,r))));XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(a2),(p.label[t]+' '+p.aggs[t].label.toLowerCase()).slice(0,31))}});
@@ -816,10 +1020,10 @@ function exportXLSX(){
 /* ================= file loading ================= */
 function readBook(file){return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>{try{
   const data=new Uint8Array(fr.result);
-  const peek=XLSX.read(data,{type:'array',sheetRows:40});
+  const peek=XLSX.read(data,{type:'array',sheetRows:40,raw:true});
   let hit=null;for(const n of peek.SheetNames){const rows=XLSX.utils.sheet_to_json(peek.Sheets[n],{header:1,defval:'',raw:true});const d=detect(rows);if(d){hit={name:n,...d};break}}
   if(!hit){res(null);return}
-  const wb=XLSX.read(data,{type:'array',cellDates:true,sheets:[hit.name]});
+  const wb=XLSX.read(data,{type:'array',cellDates:true,raw:true,sheets:[hit.name]});
   const rows=XLSX.utils.sheet_to_json(wb.Sheets[hit.name],{header:1,defval:'',raw:true});
   const d=detect(rows)||hit;
   res({kind:d.kind,hi:d.hi,rows,sheet:hit.name});
@@ -829,11 +1033,11 @@ async function addFile(file,slot){
   try{
     toast('Reading '+file.name+'…');
     const b=await readBook(file);
-    if(!b)throw new Error(file.name+' is not a recognised export. Supported: NIC Asia settlement, Coop session ledger, Global IME bank statement, CBS GL statement.');
+    if(!b)throw new Error(file.name+' is not a recognised export. Supported: NIC Asia settlement, Coop session ledger, Global IME bank statement, CBS GL statement, Kumari Bank statement, Coop ledger statement, NIC Asia system ledger, NIC Asia mbank ledger.');
     const k=KINDS[b.kind],p=P[k.p];
     const rows=k.side==='A'?p.parseA(b.rows,b.hi):p.parseB(b.rows,b.hi);
     if(!rows.length)throw new Error(file.name+' has no transaction rows.');
-    DS[k.p][k.side]={name:file.name,rows};
+    DS[k.p][k.side]={name:file.name,rows,acct:findAcct(b.rows)};
     const moved=slot&&(k.p!==cur||k.side!==slot);
     switchTo(k.p);
     toast(`${file.name} read as ${k.label} (File ${k.side==='A'?1:2}${k.p!==cur?'':''})${moved?' — placed automatically':''}. ${nfi.format(rows.length)} rows.`);
@@ -852,10 +1056,18 @@ function switchTo(p){cur=p;reconcile();view.g=null;view.sub=null;view.tab='side'
 $('#loadBtn').onclick=()=>{const i=document.createElement('input');i.type='file';i.multiple=true;i.accept='.xlsx,.xls,.csv';i.onchange=()=>[...i.files].forEach(f=>addFile(f,null));i.click()};
 
 /* ================= boot ================= */
-let seed={};try{seed=JSON.parse($('#seed').textContent)}catch(e){}
-['nic','gibl'].forEach(p=>{if(seed[p]){if(seed[p].A)DS[p].A=seed[p].A;if(seed[p].B)DS[p].B=seed[p].B}});
-cur=seed.active||(DS.gibl.A&&DS.gibl.B?'gibl':'nic');
-switchTo(cur);
+async function loadSeed(){
+  const el=$('#seed');if(!el)return {};
+  if(el.dataset.gz){try{const bin=Uint8Array.from(atob(el.textContent.trim()),c=>c.charCodeAt(0));
+    const txt=await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).text();return JSON.parse(txt)}catch(e){console.error(e);return {}}}
+  try{return JSON.parse(el.textContent)}catch(e){return {}}
+}
+(async()=>{
+  const seed=await loadSeed();
+  ['nic','gibl','kbl','nicm'].forEach(p=>{if(seed[p]){if(seed[p].A)DS[p].A=seed[p].A;if(seed[p].B)DS[p].B=seed[p].B}});
+  cur=seed.active&&DS[seed.active]?seed.active:'nic';
+  switchTo(cur);
+})();
 window.__recon={DS,P,get D(){return D},get S(){return S},parse:(kind,rows)=>{const d=detect(rows);const k=KINDS[d.kind],p=P[k.p];return {kind:d.kind,rows:k.side==='A'?p.parseA(rows,d.hi):p.parseB(rows,d.hi)}}};
 })();
 </script>
